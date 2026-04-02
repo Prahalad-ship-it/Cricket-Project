@@ -9,7 +9,7 @@ from rich.text import Text
 from rich.columns import Columns
 from rich.align import Align
 from rich import box
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import csv
 import os
@@ -34,6 +34,11 @@ LEAGUES = {
     "CPL":          6404,   # Caribbean Premier League
     "SA20":         9551,   # SA20 (South Africa)
 }
+
+
+def _date_range(days: int) -> list[str]:
+    start = datetime.utcnow()
+    return [(start + timedelta(days=i)).strftime("%Y%m%d") for i in range(days + 1)]
 
 # CSV output folder — exports will be saved here
 CSV_OUTPUT_DIR = "cricket_exports"
