@@ -40,6 +40,15 @@ def _date_range(days: int) -> list[str]:
     start = datetime.utcnow()
     return [(start + timedelta(days=i)).strftime("%Y%m%d") for i in range(days + 1)]
 
+
+def _fetch_match_summary(lid: int, eid: str) -> dict:
+    try:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/cricket/{lid}/summary?event={eid}"
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        return r.json() if r.status_code == 200 else {}
+    except Exception:
+        return {}
+
 # CSV output folder — exports will be saved here
 CSV_OUTPUT_DIR = "cricket_exports"
 
@@ -72,6 +81,15 @@ FEATURED_PLAYERS = {
 # ─────────────────────────────────────────
 # SCRAPERS
 # ─────────────────────────────────────────
+
+def _fetch_match_summary(lid: int, eid: str) -> dict:
+    try:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/cricket/{lid}/summary?event={eid}"
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        return r.json() if r.status_code == 200 else {}
+    except Exception:
+        return {}
+
 
 def get_live_scores() -> list[dict]:
     """Fetch live/recent scores from ESPN Cricket API."""
@@ -112,15 +130,82 @@ def get_live_scores() -> list[dict]:
                 )
                 innings.append(inn or "—")
 
+            if len(teams) == 2:
+                left = f"{teams[0]} {scores[0]}" + (f" ({innings[0]})" if innings[0] != "—" else "")
+                right = f"{teams[1]} {scores[1]}" + (f" ({innings[1]})" if innings[1] != "—" else "")
+                score_line = f"{left}  |  {right}"
+            else:
+                score_line = "  |  ".join(
+                    f"{teams[i]} {scores[i]}" for i in range(len(teams))
+                ) if teams else "—"
+
+            mom = "—"
+            top_batter = "—"
+            top_bowler = "—"
+            best_runs = -1
+            best_wkts = -1
+            best_econ = 999.0
+
+            lid = event.get("leagues", [{}])[0].get("id") or comp.get("league", {}).get("id")
+            if lid and status_type.get("state") in {"in", "post"}:
+                summary = _fetch_match_summary(lid, eid)
+
+                for award in summary.get("awards", []):
+                    if "match" in award.get("type", {}).get("text", "").lower():
+                        mom = award.get("athlete", {}).get("displayName", "—")
+                        break
+
+                boxscore = summary.get("boxscore", {})
+                for team_data in boxscore.get("players", []):
+                    for stat_group in team_data.get("statistics", []):
+                        sg_name = stat_group.get("type", {}).get("displayName", "").lower()
+                        if "bat" in sg_name:
+                            for athlete in stat_group.get("athletes", []):
+                                stats = {s.get("name"): s.get("displayValue") for s in athlete.get("stats", [])}
+                                runs = stats.get("runs", "0") or "0"
+                                try:
+                                    runs_int = int(runs.replace("*", ""))
+                                except Exception:
+                                    runs_int = 0
+                                if runs_int > best_runs:
+                                    best_runs = runs_int
+                                    name = athlete.get("athlete", {}).get("displayName", "?")
+                                    balls = stats.get("balls", "?")
+                                    top_batter = f"{name} {runs} ({balls}b)" if balls != "?" else f"{name} {runs}"
+                        if "bowl" in sg_name:
+                            for athlete in stat_group.get("athletes", []):
+                                stats = {s.get("name"): s.get("displayValue") for s in athlete.get("stats", [])}
+                                wickets = stats.get("wickets", "0") or "0"
+                                econ = stats.get("economy", "99") or "99"
+                                runs_conceded = stats.get("runsConceded", "?")
+                                overs = stats.get("overs", "?")
+                                try:
+                                    wkts_int = int(wickets)
+                                except Exception:
+                                    wkts_int = -1
+                                try:
+                                    econ_val = float(econ)
+                                except Exception:
+                                    econ_val = 99.0
+                                if wkts_int > best_wkts or (wkts_int == best_wkts and econ_val < best_econ):
+                                    best_wkts = wkts_int
+                                    best_econ = econ_val
+                                    name = athlete.get("athlete", {}).get("displayName", "?")
+                                    top_bowler = f"{name} {wickets}/{runs_conceded} ({overs}ov)"
+
             matches.append({
-                "league":  league,
-                "name":    event.get("shortName", event.get("name", "Unknown")),
-                "status":  status_type.get("shortDetail", status_type.get("description", "—")),
-                "state":   status_type.get("state", "pre"),   # pre / in / post
-                "teams":   teams,
-                "scores":  scores,
-                "innings": innings,
-                "venue":   comp.get("venue", {}).get("fullName", "—"),
+                "league":    league,
+                "name":      event.get("shortName", event.get("name", "Unknown")),
+                "status":    status_type.get("shortDetail", status_type.get("description", "—")),
+                "state":     status_type.get("state", "pre"),   # pre / in / post
+                "score":     score_line,
+                "top_batter": top_batter,
+                "top_bowler": top_bowler,
+                "mom":       mom,
+                "teams":     teams,
+                "scores":    scores,
+                "innings":   innings,
+                "venue":     comp.get("venue", {}).get("fullName", "—"),
             })
     except Exception:
         return []
@@ -300,14 +385,17 @@ def build_scores_panel(matches: list[dict]) -> Panel:
         header_style="bold cyan",
         border_style="cyan",
     )
-    table.add_column("League",  style="dim",          width=10)
-    table.add_column("Match",   style="bold white",   min_width=20)
-    table.add_column("Score",   style="bold yellow",  min_width=18)
-    table.add_column("Status",  style="green",        min_width=16)
-    table.add_column("Venue",   style="dim",          min_width=18)
+    table.add_column("League",      style="dim",          width=10)
+    table.add_column("Match",       style="bold white",   min_width=20)
+    table.add_column("Score",       style="bold yellow",  min_width=30)
+    table.add_column("Top Bat",     style="green",       min_width=20)
+    table.add_column("Top Bowl",    style="magenta",     min_width=20)
+    table.add_column("MoM",         style="bright_cyan", min_width=20)
+    table.add_column("Status",      style="green",       min_width=16)
+    table.add_column("Venue",       style="dim",         min_width=18)
 
     if not matches:
-        table.add_row("—", "No matches found", "—", "—", "—")
+        table.add_row("—", "No matches found", "—", "—", "—", "—", "—", "—")
     else:
         for m in matches[:10]:
             state = m["state"]
@@ -318,18 +406,13 @@ def build_scores_panel(matches: list[dict]) -> Panel:
             else:
                 status_style = "yellow"
 
-            teams  = m["teams"]
-            scores = m["scores"]
-
-            if len(teams) == 2:
-                score_str = f"{teams[0]} {scores[0]}  |  {teams[1]} {scores[1]}"
-            else:
-                score_str = "—"
-
             table.add_row(
                 m["league"],
                 m["name"],
-                score_str,
+                m.get("score", "—"),
+                m.get("top_batter", "—"),
+                m.get("top_bowler", "—"),
+                m.get("mom", "—"),
                 Text(m["status"], style=status_style),
                 m["venue"],
             )
