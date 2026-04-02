@@ -9,7 +9,7 @@ from rich.text import Text
 from rich.columns import Columns
 from rich.align import Align
 from rich import box
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 import csv
 import os
@@ -37,8 +37,23 @@ LEAGUES = {
 
 
 def _date_range(days: int) -> list[str]:
-    start = datetime.utcnow()
+    start = datetime.now(timezone.utc)
     return [(start + timedelta(days=i)).strftime("%Y%m%d") for i in range(days + 1)]
+
+
+def _fetch_scoreboard(lid: int | None = None, date_str: str | None = None) -> list[dict]:
+    base = "https://site.api.espn.com/apis/site/v2/sports/cricket"
+    if lid:
+        base += f"/{lid}"
+    base += "/scoreboard"
+    if date_str:
+        base += f"?dates={date_str}"
+
+    try:
+        r = requests.get(base, headers=HEADERS, timeout=8)
+        return r.json().get("events", []) if r.status_code == 200 else []
+    except Exception:
+        return []
 
 
 def _fetch_match_summary(lid: int, eid: str) -> dict:
@@ -82,135 +97,164 @@ FEATURED_PLAYERS = {
 # SCRAPERS
 # ─────────────────────────────────────────
 
-def _fetch_match_summary(lid: int, eid: str) -> dict:
-    try:
-        url = f"https://site.api.espn.com/apis/site/v2/sports/cricket/{lid}/summary?event={eid}"
-        r = requests.get(url, headers=HEADERS, timeout=8)
-        return r.json() if r.status_code == 200 else {}
-    except Exception:
-        return {}
-
-
 def get_live_scores() -> list[dict]:
     """Fetch live/recent scores from ESPN Cricket API."""
     matches = []
     seen = set()
-    url = "https://site.api.espn.com/apis/site/v2/sports/cricket/scoreboard"
 
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=8)
-        if r.status_code != 200:
-            return []
-        data = r.json()
+    for event in _fetch_scoreboard():
+        eid = event.get("id")
+        if eid in seen:
+            continue
+        seen.add(eid)
 
-        for event in data.get("events", []):
-            eid = event.get("id")
-            if eid in seen:
-                continue
-            seen.add(eid)
+        competitions = event.get("competitions", [{}])
+        comp = competitions[0] if competitions else {}
+        competitors = comp.get("competitors", [])
+        status_type = event.get("status", {}).get("type", {})
 
-            competitions = event.get("competitions", [{}])
-            comp = competitions[0] if competitions else {}
-            competitors = comp.get("competitors", [])
-            status_type = event.get("status", {}).get("type", {})
+        league = event.get("leagues", [{}])[0].get("shortName")
+        if not league:
+            league = comp.get("league", {}).get("shortName")
+        if not league:
+            league = event.get("leagues", [{}])[0].get("name") or "Unknown"
 
-            league = event.get("leagues", [{}])[0].get("shortName")
-            if not league:
-                league = comp.get("league", {}).get("shortName")
-            if not league:
-                league = event.get("leagues", [{}])[0].get("name") or "Unknown"
+        teams, scores, innings = [], [], []
+        for c in competitors:
+            teams.append(c.get("team", {}).get("abbreviation", "???"))
+            scores.append(c.get("score", "—"))
+            linescores = c.get("linescores", [])
+            inn = " / ".join(
+                str(ls.get("displayValue", "")) for ls in linescores if ls.get("displayValue") is not None
+            )
+            innings.append(inn or "—")
 
-            teams, scores, innings = [], [], []
-            for c in competitors:
-                teams.append(c.get("team", {}).get("abbreviation", "???"))
-                scores.append(c.get("score", "—"))
-                linescores = c.get("linescores", [])
-                inn = " / ".join(
-                    ls.get("displayValue", "") for ls in linescores if ls.get("displayValue")
-                )
-                innings.append(inn or "—")
+        if len(teams) == 2:
+            left = f"{teams[0]} {scores[0]}" + (f" ({innings[0]})" if innings[0] != "—" else "")
+            right = f"{teams[1]} {scores[1]}" + (f" ({innings[1]})" if innings[1] != "—" else "")
+            score_line = f"{left}  |  {right}"
+        else:
+            score_line = "  |  ".join(
+                f"{teams[i]} {scores[i]}" for i in range(len(teams))
+            ) if teams else "—"
 
-            if len(teams) == 2:
-                left = f"{teams[0]} {scores[0]}" + (f" ({innings[0]})" if innings[0] != "—" else "")
-                right = f"{teams[1]} {scores[1]}" + (f" ({innings[1]})" if innings[1] != "—" else "")
-                score_line = f"{left}  |  {right}"
-            else:
-                score_line = "  |  ".join(
-                    f"{teams[i]} {scores[i]}" for i in range(len(teams))
-                ) if teams else "—"
+        mom = "—"
+        top_batter = "—"
+        top_bowler = "—"
+        best_runs = -1
+        best_wkts = -1
+        best_econ = 999.0
 
-            mom = "—"
-            top_batter = "—"
-            top_bowler = "—"
-            best_runs = -1
-            best_wkts = -1
-            best_econ = 999.0
+        lid = event.get("leagues", [{}])[0].get("id") or comp.get("league", {}).get("id")
+        if lid and status_type.get("state") in {"in", "post"}:
+            summary = _fetch_match_summary(lid, eid)
 
-            lid = event.get("leagues", [{}])[0].get("id") or comp.get("league", {}).get("id")
-            if lid and status_type.get("state") in {"in", "post"}:
-                summary = _fetch_match_summary(lid, eid)
+            for award in summary.get("awards", []):
+                if "match" in award.get("type", {}).get("text", "").lower():
+                    mom = award.get("athlete", {}).get("displayName", "—")
+                    break
 
-                for award in summary.get("awards", []):
-                    if "match" in award.get("type", {}).get("text", "").lower():
-                        mom = award.get("athlete", {}).get("displayName", "—")
-                        break
+            boxscore = summary.get("boxscore", {})
+            for team_data in boxscore.get("players", []):
+                for stat_group in team_data.get("statistics", []):
+                    sg_name = stat_group.get("type", {}).get("displayName", "").lower()
+                    if "bat" in sg_name:
+                        for athlete in stat_group.get("athletes", []):
+                            stats = {s.get("name"): s.get("displayValue") for s in athlete.get("stats", [])}
+                            runs = stats.get("runs", "0") or "0"
+                            try:
+                                runs_int = int(runs.replace("*", ""))
+                            except Exception:
+                                runs_int = 0
+                            if runs_int > best_runs:
+                                best_runs = runs_int
+                                name = athlete.get("athlete", {}).get("displayName", "?")
+                                balls = stats.get("balls", "?")
+                                top_batter = f"{name} {runs} ({balls}b)" if balls != "?" else f"{name} {runs}"
+                    if "bowl" in sg_name:
+                        for athlete in stat_group.get("athletes", []):
+                            stats = {s.get("name"): s.get("displayValue") for s in athlete.get("stats", [])}
+                            wickets = stats.get("wickets", "0") or "0"
+                            econ = stats.get("economy", "99") or "99"
+                            runs_conceded = stats.get("runsConceded", "?")
+                            overs = stats.get("overs", "?")
+                            try:
+                                wkts_int = int(wickets)
+                            except Exception:
+                                wkts_int = -1
+                            try:
+                                econ_val = float(econ)
+                            except Exception:
+                                econ_val = 99.0
+                            if wkts_int > best_wkts or (wkts_int == best_wkts and econ_val < best_econ):
+                                best_wkts = wkts_int
+                                best_econ = econ_val
+                                name = athlete.get("athlete", {}).get("displayName", "?")
+                                top_bowler = f"{name} {wickets}/{runs_conceded} ({overs}ov)"
 
-                boxscore = summary.get("boxscore", {})
-                for team_data in boxscore.get("players", []):
-                    for stat_group in team_data.get("statistics", []):
-                        sg_name = stat_group.get("type", {}).get("displayName", "").lower()
-                        if "bat" in sg_name:
-                            for athlete in stat_group.get("athletes", []):
-                                stats = {s.get("name"): s.get("displayValue") for s in athlete.get("stats", [])}
-                                runs = stats.get("runs", "0") or "0"
-                                try:
-                                    runs_int = int(runs.replace("*", ""))
-                                except Exception:
-                                    runs_int = 0
-                                if runs_int > best_runs:
-                                    best_runs = runs_int
-                                    name = athlete.get("athlete", {}).get("displayName", "?")
-                                    balls = stats.get("balls", "?")
-                                    top_batter = f"{name} {runs} ({balls}b)" if balls != "?" else f"{name} {runs}"
-                        if "bowl" in sg_name:
-                            for athlete in stat_group.get("athletes", []):
-                                stats = {s.get("name"): s.get("displayValue") for s in athlete.get("stats", [])}
-                                wickets = stats.get("wickets", "0") or "0"
-                                econ = stats.get("economy", "99") or "99"
-                                runs_conceded = stats.get("runsConceded", "?")
-                                overs = stats.get("overs", "?")
-                                try:
-                                    wkts_int = int(wickets)
-                                except Exception:
-                                    wkts_int = -1
-                                try:
-                                    econ_val = float(econ)
-                                except Exception:
-                                    econ_val = 99.0
-                                if wkts_int > best_wkts or (wkts_int == best_wkts and econ_val < best_econ):
-                                    best_wkts = wkts_int
-                                    best_econ = econ_val
-                                    name = athlete.get("athlete", {}).get("displayName", "?")
-                                    top_bowler = f"{name} {wickets}/{runs_conceded} ({overs}ov)"
+        matches.append({
+            "league":    league,
+            "name":      event.get("shortName", event.get("name", "Unknown")),
+            "status":    status_type.get("shortDetail", status_type.get("description", "—")),
+            "state":     status_type.get("state", "pre"),   # pre / in / post
+            "score":     score_line,
+            "top_batter": top_batter,
+            "top_bowler": top_bowler,
+            "mom":       mom,
+            "teams":     teams,
+            "scores":    scores,
+            "innings":   innings,
+            "venue":     comp.get("venue", {}).get("fullName", "—"),
+        })
 
-            matches.append({
-                "league":    league,
-                "name":      event.get("shortName", event.get("name", "Unknown")),
-                "status":    status_type.get("shortDetail", status_type.get("description", "—")),
-                "state":     status_type.get("state", "pre"),   # pre / in / post
-                "score":     score_line,
-                "top_batter": top_batter,
-                "top_bowler": top_bowler,
-                "mom":       mom,
-                "teams":     teams,
-                "scores":    scores,
-                "innings":   innings,
-                "venue":     comp.get("venue", {}).get("fullName", "—"),
-            })
-    except Exception:
-        return []
+    if not matches:
+        for league_name, lid in LEAGUES.items():
+            for event in _fetch_scoreboard(lid):
+                eid = event.get("id")
+                if eid in seen:
+                    continue
+                seen.add(eid)
 
-    # Sort: live first, then recent, then upcoming
+                competitions = event.get("competitions", [{}])
+                comp = competitions[0] if competitions else {}
+                competitors = comp.get("competitors", [])
+                status_type = event.get("status", {}).get("type", {})
+
+                league = league_name
+                teams, scores, innings = [], [], []
+                for c in competitors:
+                    teams.append(c.get("team", {}).get("abbreviation", "???"))
+                    scores.append(c.get("score", "—"))
+                    linescores = c.get("linescores", [])
+                    inn = " / ".join(
+                        str(ls.get("displayValue", "")) for ls in linescores if ls.get("displayValue") is not None
+                    )
+                    innings.append(inn or "—")
+
+                if len(teams) == 2:
+                    left = f"{teams[0]} {scores[0]}" + (f" ({innings[0]})" if innings[0] != "—" else "")
+                    right = f"{teams[1]} {scores[1]}" + (f" ({innings[1]})" if innings[1] != "—" else "")
+                    score_line = f"{left}  |  {right}"
+                else:
+                    score_line = "  |  ".join(
+                        f"{teams[i]} {scores[i]}" for i in range(len(teams))
+                    ) if teams else "—"
+
+                matches.append({
+                    "league":    league,
+                    "name":      event.get("shortName", event.get("name", "Unknown")),
+                    "status":    status_type.get("shortDetail", status_type.get("description", "—")),
+                    "state":     status_type.get("state", "pre"),
+                    "score":     score_line,
+                    "top_batter": "—",
+                    "top_bowler": "—",
+                    "mom":       "—",
+                    "teams":     teams,
+                    "scores":    scores,
+                    "innings":   innings,
+                    "venue":     comp.get("venue", {}).get("fullName", "—"),
+                })
+
     order = {"in": 0, "post": 1, "pre": 2}
     matches.sort(key=lambda m: order.get(m["state"], 3))
     return matches
@@ -222,14 +266,45 @@ def get_schedule() -> list[dict]:
     seen = set()
 
     for date_str in _date_range(7):
-        url = f"https://site.api.espn.com/apis/site/v2/sports/cricket/scoreboard?dates={date_str}"
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=8)
-            if r.status_code != 200:
+        for event in _fetch_scoreboard(None, date_str):
+            eid = event.get("id")
+            if eid in seen:
                 continue
-            data = r.json()
+            seen.add(eid)
 
-            for event in data.get("events", []):
+            status_type = event.get("status", {}).get("type", {})
+            if status_type.get("state") != "pre":
+                continue
+
+            competitions = event.get("competitions", [{}])
+            comp = competitions[0] if competitions else {}
+            league = event.get("leagues", [{}])[0].get("shortName")
+            if not league:
+                league = comp.get("league", {}).get("shortName")
+            if not league:
+                league = event.get("leagues", [{}])[0].get("name") or "Unknown"
+
+            teams = [
+                c.get("team", {}).get("displayName", "?")
+                for c in comp.get("competitors", [])
+            ]
+
+            try:
+                dt = datetime.fromisoformat(event.get("date", "").replace("Z", "+00:00"))
+                formatted = dt.strftime("%d %b %Y  %H:%M UTC")
+            except Exception:
+                formatted = event.get("date", "—")
+
+            fixtures.append({
+                "league": league,
+                "match":  " vs ".join(teams) if teams else event.get("name", "—"),
+                "date":   formatted,
+                "venue":  comp.get("venue", {}).get("fullName", "—"),
+            })
+
+    if not fixtures:
+        for league_name, lid in LEAGUES.items():
+            for event in _fetch_scoreboard(lid):
                 eid = event.get("id")
                 if eid in seen:
                     continue
@@ -241,12 +316,6 @@ def get_schedule() -> list[dict]:
 
                 competitions = event.get("competitions", [{}])
                 comp = competitions[0] if competitions else {}
-                league = event.get("leagues", [{}])[0].get("shortName")
-                if not league:
-                    league = comp.get("league", {}).get("shortName")
-                if not league:
-                    league = event.get("leagues", [{}])[0].get("name") or "Unknown"
-
                 teams = [
                     c.get("team", {}).get("displayName", "?")
                     for c in comp.get("competitors", [])
@@ -259,17 +328,13 @@ def get_schedule() -> list[dict]:
                     formatted = event.get("date", "—")
 
                 fixtures.append({
-                    "league": league,
+                    "league": league_name,
                     "match":  " vs ".join(teams) if teams else event.get("name", "—"),
                     "date":   formatted,
                     "venue":  comp.get("venue", {}).get("fullName", "—"),
                 })
-        except Exception:
-            continue
 
     return fixtures[:30]   # cap at 30 upcoming fixtures
-
-    return fixtures[:12]   # cap at 12
 
 
 def get_player_stats() -> list[dict]:
