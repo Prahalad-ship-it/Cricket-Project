@@ -98,162 +98,128 @@ FEATURED_PLAYERS = {
 # ─────────────────────────────────────────
 
 def get_live_scores() -> list[dict]:
-    """Fetch live/recent scores from ESPN Cricket API."""
+    """Fetch live/recent scores from ESPN Cricket API, prioritizing league-specific endpoints."""
     matches = []
     seen = set()
 
-    for event in _fetch_scoreboard():
-        eid = event.get("id")
-        if eid in seen:
-            continue
-        seen.add(eid)
+    for league_name, lid in LEAGUES.items():
+        for event in _fetch_scoreboard(lid):
+            eid = event.get("id")
+            if eid in seen:
+                continue
+            seen.add(eid)
 
-        competitions = event.get("competitions", [{}])
-        comp = competitions[0] if competitions else {}
-        competitors = comp.get("competitors", [])
-        status_type = event.get("status", {}).get("type", {})
+            competitions = event.get("competitions", [{}])
+            comp = competitions[0] if competitions else {}
+            competitors = comp.get("competitors", [])
+            status_type = event.get("status", {}).get("type", {})
+            state = status_type.get("state", "pre")
 
-        league = event.get("leagues", [{}])[0].get("shortName")
-        if not league:
-            league = comp.get("league", {}).get("shortName")
-        if not league:
-            league = event.get("leagues", [{}])[0].get("name") or "Unknown"
+            if state == "pre":
+                continue
 
-        teams, scores, innings = [], [], []
-        for c in competitors:
-            teams.append(c.get("team", {}).get("abbreviation", "???"))
-            scores.append(c.get("score", "—"))
-            linescores = c.get("linescores", [])
-            inn = " / ".join(
-                str(ls.get("displayValue", "")) for ls in linescores if ls.get("displayValue") is not None
-            )
-            innings.append(inn or "—")
+            league = league_name
+            teams, scores, innings = [], [], []
+            for c in competitors:
+                teams.append(c.get("team", {}).get("abbreviation", "???"))
+                scores.append(c.get("score", "—"))
+                linescores = c.get("linescores", [])
+                inn = " / ".join(
+                    str(ls.get("displayValue", "")) for ls in linescores if ls.get("displayValue") is not None
+                )
+                innings.append(inn or "—")
 
-        if len(teams) == 2:
-            left = f"{teams[0]} {scores[0]}" + (f" ({innings[0]})" if innings[0] != "—" else "")
-            right = f"{teams[1]} {scores[1]}" + (f" ({innings[1]})" if innings[1] != "—" else "")
-            score_line = f"{left}  |  {right}"
-        else:
-            score_line = "  |  ".join(
-                f"{teams[i]} {scores[i]}" for i in range(len(teams))
-            ) if teams else "—"
+            if len(teams) == 2:
+                left = f"{teams[0]} {scores[0]}" + (f" ({innings[0]})" if innings[0] != "—" else "")
+                right = f"{teams[1]} {scores[1]}" + (f" ({innings[1]})" if innings[1] != "—" else "")
+                score_line = f"{left}  |  {right}"
+            else:
+                score_line = "  |  ".join(
+                    f"{teams[i]} {scores[i]}" for i in range(len(teams))
+                ) if teams else "—"
 
-        mom = "—"
-        top_batter = "—"
-        top_bowler = "—"
-        best_runs = -1
-        best_wkts = -1
-        best_econ = 999.0
+            mom = "—"
+            winner = "—"
+            loser = "—"
+            top_batter = "—"
+            top_bowler = "—"
+            player_of_series = "—"
+            best_runs = -1
+            best_wkts = -1
+            best_econ = 999.0
 
-        lid = event.get("leagues", [{}])[0].get("id") or comp.get("league", {}).get("id")
-        if lid and status_type.get("state") in {"in", "post"}:
-            summary = _fetch_match_summary(lid, eid)
+            lid_val = event.get("leagues", [{}])[0].get("id") or comp.get("league", {}).get("id")
+            if lid_val and state in {"in", "post"}:
+                summary = _fetch_match_summary(lid_val, eid)
 
-            for award in summary.get("awards", []):
-                if "match" in award.get("type", {}).get("text", "").lower():
-                    mom = award.get("athlete", {}).get("displayName", "—")
-                    break
+                for award in summary.get("awards", []):
+                    award_text = award.get("type", {}).get("text", "").lower()
+                    if "match" in award_text:
+                        mom = award.get("athlete", {}).get("displayName", "—")
+                    elif "series" in award_text:
+                        player_of_series = award.get("athlete", {}).get("displayName", "—")
 
-            boxscore = summary.get("boxscore", {})
-            for team_data in boxscore.get("players", []):
-                for stat_group in team_data.get("statistics", []):
-                    sg_name = stat_group.get("type", {}).get("displayName", "").lower()
-                    if "bat" in sg_name:
-                        for athlete in stat_group.get("athletes", []):
-                            stats = {s.get("name"): s.get("displayValue") for s in athlete.get("stats", [])}
-                            runs = stats.get("runs", "0") or "0"
-                            try:
-                                runs_int = int(runs.replace("*", ""))
-                            except Exception:
-                                runs_int = 0
-                            if runs_int > best_runs:
-                                best_runs = runs_int
-                                name = athlete.get("athlete", {}).get("displayName", "?")
-                                balls = stats.get("balls", "?")
-                                top_batter = f"{name} {runs} ({balls}b)" if balls != "?" else f"{name} {runs}"
-                    if "bowl" in sg_name:
-                        for athlete in stat_group.get("athletes", []):
-                            stats = {s.get("name"): s.get("displayValue") for s in athlete.get("stats", [])}
-                            wickets = stats.get("wickets", "0") or "0"
-                            econ = stats.get("economy", "99") or "99"
-                            runs_conceded = stats.get("runsConceded", "?")
-                            overs = stats.get("overs", "?")
-                            try:
-                                wkts_int = int(wickets)
-                            except Exception:
-                                wkts_int = -1
-                            try:
-                                econ_val = float(econ)
-                            except Exception:
-                                econ_val = 99.0
-                            if wkts_int > best_wkts or (wkts_int == best_wkts and econ_val < best_econ):
-                                best_wkts = wkts_int
-                                best_econ = econ_val
-                                name = athlete.get("athlete", {}).get("displayName", "?")
-                                top_bowler = f"{name} {wickets}/{runs_conceded} ({overs}ov)"
+                for competitor in competitors:
+                    if competitor.get("winner"):
+                        winner = competitor.get("team", {}).get("abbreviation", "—")
+                    else:
+                        loser = competitor.get("team", {}).get("abbreviation", "—")
 
-        matches.append({
-            "league":    league,
-            "name":      event.get("shortName", event.get("name", "Unknown")),
-            "status":    status_type.get("shortDetail", status_type.get("description", "—")),
-            "state":     status_type.get("state", "pre"),   # pre / in / post
-            "score":     score_line,
-            "top_batter": top_batter,
-            "top_bowler": top_bowler,
-            "mom":       mom,
-            "teams":     teams,
-            "scores":    scores,
-            "innings":   innings,
-            "venue":     comp.get("venue", {}).get("fullName", "—"),
-        })
+                boxscore = summary.get("boxscore", {})
+                for team_data in boxscore.get("players", []):
+                    for stat_group in team_data.get("statistics", []):
+                        sg_name = stat_group.get("type", {}).get("displayName", "").lower()
+                        if "bat" in sg_name:
+                            for athlete in stat_group.get("athletes", []):
+                                stats = {s.get("name"): s.get("displayValue") for s in athlete.get("stats", [])}
+                                runs = stats.get("runs", "0") or "0"
+                                try:
+                                    runs_int = int(runs.replace("*", ""))
+                                except Exception:
+                                    runs_int = 0
+                                if runs_int > best_runs:
+                                    best_runs = runs_int
+                                    name = athlete.get("athlete", {}).get("displayName", "?")
+                                    balls = stats.get("balls", "?")
+                                    top_batter = f"{name} {runs} ({balls}b)" if balls != "?" else f"{name} {runs}"
+                        if "bowl" in sg_name:
+                            for athlete in stat_group.get("athletes", []):
+                                stats = {s.get("name"): s.get("displayValue") for s in athlete.get("stats", [])}
+                                wickets = stats.get("wickets", "0") or "0"
+                                econ = stats.get("economy", "99") or "99"
+                                runs_conceded = stats.get("runsConceded", "?")
+                                overs = stats.get("overs", "?")
+                                try:
+                                    wkts_int = int(wickets)
+                                except Exception:
+                                    wkts_int = -1
+                                try:
+                                    econ_val = float(econ)
+                                except Exception:
+                                    econ_val = 99.0
+                                if wkts_int > best_wkts or (wkts_int == best_wkts and econ_val < best_econ):
+                                    best_wkts = wkts_int
+                                    best_econ = econ_val
+                                    name = athlete.get("athlete", {}).get("displayName", "?")
+                                    top_bowler = f"{name} {wickets}/{runs_conceded} ({overs}ov)"
 
-    if not matches:
-        for league_name, lid in LEAGUES.items():
-            for event in _fetch_scoreboard(lid):
-                eid = event.get("id")
-                if eid in seen:
-                    continue
-                seen.add(eid)
-
-                competitions = event.get("competitions", [{}])
-                comp = competitions[0] if competitions else {}
-                competitors = comp.get("competitors", [])
-                status_type = event.get("status", {}).get("type", {})
-
-                league = league_name
-                teams, scores, innings = [], [], []
-                for c in competitors:
-                    teams.append(c.get("team", {}).get("abbreviation", "???"))
-                    scores.append(c.get("score", "—"))
-                    linescores = c.get("linescores", [])
-                    inn = " / ".join(
-                        str(ls.get("displayValue", "")) for ls in linescores if ls.get("displayValue") is not None
-                    )
-                    innings.append(inn or "—")
-
-                if len(teams) == 2:
-                    left = f"{teams[0]} {scores[0]}" + (f" ({innings[0]})" if innings[0] != "—" else "")
-                    right = f"{teams[1]} {scores[1]}" + (f" ({innings[1]})" if innings[1] != "—" else "")
-                    score_line = f"{left}  |  {right}"
-                else:
-                    score_line = "  |  ".join(
-                        f"{teams[i]} {scores[i]}" for i in range(len(teams))
-                    ) if teams else "—"
-
-                matches.append({
-                    "league":    league,
-                    "name":      event.get("shortName", event.get("name", "Unknown")),
-                    "status":    status_type.get("shortDetail", status_type.get("description", "—")),
-                    "state":     status_type.get("state", "pre"),
-                    "score":     score_line,
-                    "top_batter": "—",
-                    "top_bowler": "—",
-                    "mom":       "—",
-                    "teams":     teams,
-                    "scores":    scores,
-                    "innings":   innings,
-                    "venue":     comp.get("venue", {}).get("fullName", "—"),
-                })
+            matches.append({
+                "league":         league,
+                "name":           event.get("shortName", event.get("name", "Unknown")),
+                "status":         status_type.get("shortDetail", status_type.get("description", "—")),
+                "state":          state,
+                "score":          score_line,
+                "winner":         winner,
+                "loser":          loser,
+                "top_batter":     top_batter,
+                "top_bowler":     top_bowler,
+                "mom":            mom,
+                "player_series":  player_of_series,
+                "teams":          teams,
+                "scores":         scores,
+                "innings":        innings,
+                "venue":          comp.get("venue", {}).get("fullName", "—"),
+            })
 
     order = {"in": 0, "post": 1, "pre": 2}
     matches.sort(key=lambda m: order.get(m["state"], 3))
@@ -396,13 +362,13 @@ def get_player_stats() -> list[dict]:
 def export_to_csv(matches: list[dict], fixtures: list[dict], players: list[dict]) -> str:
     """Export all scraped data to timestamped CSV files. Returns the output folder path."""
     os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     # ── Live Scores ──────────────────────────────────────────────────
     scores_file = os.path.join(CSV_OUTPUT_DIR, f"live_scores_{timestamp}.csv")
     with open(scores_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["League", "Match", "Team 1", "Score 1", "Team 2", "Score 2", "Status", "Venue"])
+        writer.writerow(["League", "Match", "Team 1", "Score 1", "Team 2", "Score 2", "Winner", "Loser", "MoM", "Player of Series", "Top Batter", "Top Bowler", "Status", "Venue"])
         for m in matches:
             teams  = m.get("teams",  ["—", "—"])
             scores = m.get("scores", ["—", "—"])
@@ -413,6 +379,12 @@ def export_to_csv(matches: list[dict], fixtures: list[dict], players: list[dict]
                 scores[0] if len(scores) > 0 else "—",
                 teams[1]  if len(teams)  > 1 else "—",
                 scores[1] if len(scores) > 1 else "—",
+                m.get("winner", "—"),
+                m.get("loser", "—"),
+                m.get("mom", "—"),
+                m.get("player_series", "—"),
+                m.get("top_batter", "—"),
+                m.get("top_bowler", "—"),
                 m.get("status", "—"),
                 m.get("venue",  "—"),
             ])
@@ -450,14 +422,14 @@ def build_scores_panel(matches: list[dict]) -> Panel:
         header_style="bold cyan",
         border_style="cyan",
     )
-    table.add_column("League",      style="dim",          width=10)
-    table.add_column("Match",       style="bold white",   min_width=20)
-    table.add_column("Score",       style="bold yellow",  min_width=30)
-    table.add_column("Top Bat",     style="green",       min_width=20)
-    table.add_column("Top Bowl",    style="magenta",     min_width=20)
-    table.add_column("MoM",         style="bright_cyan", min_width=20)
-    table.add_column("Status",      style="green",       min_width=16)
-    table.add_column("Venue",       style="dim",         min_width=18)
+    table.add_column("League",      style="dim",          width=8)
+    table.add_column("Match",       style="bold white",   min_width=18)
+    table.add_column("Score",       style="bold yellow",  min_width=28)
+    table.add_column("Winner",      style="bold green",   min_width=12)
+    table.add_column("MoM",         style="bright_cyan", min_width=16)
+    table.add_column("PoS",         style="magenta",     min_width=12)
+    table.add_column("Status",      style="green",       min_width=14)
+    table.add_column("Venue",       style="dim",         min_width=14)
 
     if not matches:
         table.add_row("—", "No matches found", "—", "—", "—", "—", "—", "—")
@@ -475,9 +447,9 @@ def build_scores_panel(matches: list[dict]) -> Panel:
                 m["league"],
                 m["name"],
                 m.get("score", "—"),
-                m.get("top_batter", "—"),
-                m.get("top_bowler", "—"),
+                m.get("winner", "—"),
                 m.get("mom", "—"),
+                m.get("player_series", "—"),
                 Text(m["status"], style=status_style),
                 m["venue"],
             )
@@ -530,7 +502,7 @@ def build_players_panel(players: list[dict]) -> Panel:
 
 
 def build_header() -> Panel:
-    now = datetime.utcnow().strftime("%d %b %Y  %H:%M UTC")
+    now = datetime.now(timezone.utc).strftime("%d %b %Y  %H:%M UTC")
     title = Text("🏏  CRICKET DASHBOARD", style="bold white on dark_green", justify="center")
     sub   = Text(f"Live scores · Fixtures · Player stats  |  Last updated: {now}", style="dim", justify="center")
     return Panel(Align.center(title + "\n" + sub), border_style="green", padding=(0, 2))
