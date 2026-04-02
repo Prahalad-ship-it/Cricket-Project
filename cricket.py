@@ -72,50 +72,53 @@ def get_live_scores() -> list[dict]:
     """Fetch live/recent scores from ESPN Cricket API."""
     matches = []
     seen = set()
+    url = "https://site.api.espn.com/apis/site/v2/sports/cricket/scoreboard"
 
-    for league_name, lid in LEAGUES.items():
-        url = f"https://site.api.espn.com/apis/site/v2/sports/cricket/{lid}/scoreboard"
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=8)
-            if r.status_code != 200:
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+
+        for event in data.get("events", []):
+            eid = event.get("id")
+            if eid in seen:
                 continue
-            data = r.json()
+            seen.add(eid)
 
-            for event in data.get("events", []):
-                eid = event.get("id")
-                if eid in seen:
-                    continue
-                seen.add(eid)
+            competitions = event.get("competitions", [{}])
+            comp = competitions[0] if competitions else {}
+            competitors = comp.get("competitors", [])
+            status_type = event.get("status", {}).get("type", {})
 
-                competitions = event.get("competitions", [{}])
-                comp = competitions[0] if competitions else {}
-                competitors = comp.get("competitors", [])
-                status_obj = event.get("status", {})
-                status_type = status_obj.get("type", {})
+            league = event.get("leagues", [{}])[0].get("shortName")
+            if not league:
+                league = comp.get("league", {}).get("shortName")
+            if not league:
+                league = event.get("leagues", [{}])[0].get("name") or "Unknown"
 
-                teams, scores, innings = [], [], []
-                for c in competitors:
-                    teams.append(c.get("team", {}).get("abbreviation", "???"))
-                    scores.append(c.get("score", "—"))
-                    # Try to grab innings detail if available
-                    linescores = c.get("linescores", [])
-                    inn = " / ".join(
-                        ls.get("displayValue", "") for ls in linescores if ls.get("displayValue")
-                    )
-                    innings.append(inn or "—")
+            teams, scores, innings = [], [], []
+            for c in competitors:
+                teams.append(c.get("team", {}).get("abbreviation", "???"))
+                scores.append(c.get("score", "—"))
+                linescores = c.get("linescores", [])
+                inn = " / ".join(
+                    ls.get("displayValue", "") for ls in linescores if ls.get("displayValue")
+                )
+                innings.append(inn or "—")
 
-                matches.append({
-                    "league":  league_name,
-                    "name":    event.get("shortName", event.get("name", "Unknown")),
-                    "status":  status_type.get("shortDetail", status_type.get("description", "—")),
-                    "state":   status_type.get("state", "pre"),   # pre / in / post
-                    "teams":   teams,
-                    "scores":  scores,
-                    "innings": innings,
-                    "venue":   comp.get("venue", {}).get("fullName", "—"),
-                })
-        except Exception:
-            continue
+            matches.append({
+                "league":  league,
+                "name":    event.get("shortName", event.get("name", "Unknown")),
+                "status":  status_type.get("shortDetail", status_type.get("description", "—")),
+                "state":   status_type.get("state", "pre"),   # pre / in / post
+                "teams":   teams,
+                "scores":  scores,
+                "innings": innings,
+                "venue":   comp.get("venue", {}).get("fullName", "—"),
+            })
+    except Exception:
+        return []
 
     # Sort: live first, then recent, then upcoming
     order = {"in": 0, "post": 1, "pre": 2}
@@ -128,8 +131,8 @@ def get_schedule() -> list[dict]:
     fixtures = []
     seen = set()
 
-    for league_name, lid in LEAGUES.items():
-        url = f"https://site.api.espn.com/apis/site/v2/sports/cricket/{lid}/scoreboard"
+    for date_str in _date_range(7):
+        url = f"https://site.api.espn.com/apis/site/v2/sports/cricket/scoreboard?dates={date_str}"
         try:
             r = requests.get(url, headers=HEADERS, timeout=8)
             if r.status_code != 200:
@@ -146,28 +149,35 @@ def get_schedule() -> list[dict]:
                 if status_type.get("state") != "pre":
                     continue
 
-                date_str = event.get("date", "")
-                try:
-                    dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                    formatted = dt.strftime("%d %b %Y  %H:%M UTC")
-                except Exception:
-                    formatted = date_str
-
                 competitions = event.get("competitions", [{}])
                 comp = competitions[0] if competitions else {}
+                league = event.get("leagues", [{}])[0].get("shortName")
+                if not league:
+                    league = comp.get("league", {}).get("shortName")
+                if not league:
+                    league = event.get("leagues", [{}])[0].get("name") or "Unknown"
+
                 teams = [
                     c.get("team", {}).get("displayName", "?")
                     for c in comp.get("competitors", [])
                 ]
 
+                try:
+                    dt = datetime.fromisoformat(event.get("date", "").replace("Z", "+00:00"))
+                    formatted = dt.strftime("%d %b %Y  %H:%M UTC")
+                except Exception:
+                    formatted = event.get("date", "—")
+
                 fixtures.append({
-                    "league": league_name,
+                    "league": league,
                     "match":  " vs ".join(teams) if teams else event.get("name", "—"),
                     "date":   formatted,
                     "venue":  comp.get("venue", {}).get("fullName", "—"),
                 })
         except Exception:
             continue
+
+    return fixtures[:30]   # cap at 30 upcoming fixtures
 
     return fixtures[:12]   # cap at 12
 
